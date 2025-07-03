@@ -1,0 +1,37 @@
+FROM node:20-alpine AS build
+
+WORKDIR /app
+
+#RUN corepack enable && corepack prepare pnpm@latest --activate
+
+COPY package*.json ./
+#COPY package*.json pnpm-lock.yaml ./
+
+RUN npm install
+#RUN pnpm install --frozen-lockfile
+
+COPY . .
+
+RUN npm run build
+#RUN pnpm build
+
+FROM node:20-alpine AS production
+
+ARG NODE_ENV=production
+ENV NODE_ENV=${NODE_ENV}
+
+WORKDIR /app
+
+#RUN corepack enable && corepack prepare pnpm@latest --activate
+
+COPY package*.json ./
+#COPY package*.json pnpm-lock.yaml ./
+COPY .env .env
+
+RUN npm install --only=production
+#RUN pnpm install --prod --frozen-lockfile
+
+COPY --from=build /app/dist ./dist
+
+EXPOSE 3000
+CMD ["node", "dist/main.js"]
