@@ -1,0 +1,89 @@
+# stage build
+FROM ubuntu:24.04 AS builder
+# dependency build php
+RUN apt update && apt install -y \
+    build-essential pkg-config wget curl nano \
+    libxml2-dev libcurl4-openssl-dev libjpeg-dev libpng-dev libwebp-dev \
+    libonig-dev libzip-dev libssl-dev libsqlite3-dev libreadline-dev \
+    libxslt1-dev libffi-dev libargon2-dev libsystemd-dev \
+    libmysqlclient-dev libicu-dev \
+    libtidy-dev libfreetype6-dev zlib1g-dev \
+    && mkdir -p /build
+WORKDIR /build
+ENV PHP_VERSION=8.2.26
+RUN wget https://www.php.net/distributions/php-${PHP_VERSION}.tar.gz && tar -xzf php-${PHP_VERSION}.tar.gz
+WORKDIR /build/php-${PHP_VERSION}
+# mac dinh mot so extension chua bat
+RUN ./configure --prefix=/usr/local/php --enable-fpm --with-openssl --with-zlib --with-curl --enable-mbstring --enable-intl  --with-zip --with-gd  --enable-opcache --enable-ctype --enable-session --enable-json --enable-filter --enable-simplexml --enable-xml --enable-dom --enable-xmlwriter --enable-phar --enable-gd --with-webp --with-jpeg --with-freetype --enable-soap --enable-sockets --enable-pcntl --with-tidy --with-pear \
+    && make -j"$(nproc)" && make install
+RUN cp php.ini-production /usr/local/php/lib/php.ini \
+    && cp /usr/local/php/etc/php-fpm.conf.default /usr/local/php/etc/php-fpm.conf \
+    && cp /usr/local/php/etc/php-fpm.d/www.conf.default /usr/local/php/etc/php-fpm.d/www.conf 
+# Cài thêm dependencies cho extension khong co trong core
+RUN apt update && apt install -y libmagickwand-dev libmagickcore-dev && ln -s /usr/include/x86_64-linux-gnu/curl /usr/include/curl
+# Install PECL extensions
+RUN /usr/local/php/bin/pecl install redis-5.3.7 apcu-5.1.22 mongodb-1.17.0 imagick-3.7.0 solr-2.6.0 \
+    && echo "extension=redis.so" >> /usr/local/php/lib/php.ini \
+    && echo "extension=apcu.so" >> /usr/local/php/lib/php.ini \
+    && echo "extension=mongodb.so" >> /usr/local/php/lib/php.ini \
+    && echo "extension=imagick.so" >> /usr/local/php/lib/php.ini \
+    && echo "extension=solr.so" >> /usr/local/php/lib/php.ini
+
+# Stage composer dependencies
+FROM composer:2 AS vendor
+WORKDIR /app
+COPY composer.json composer.lock ./
+RUN --mount=type=cache,target=/root/.composer \
+    composer config allow-plugins.ayesh/composer-preload true && composer install --ignore-platform-reqs --optimize-autoloader --no-dev --prefer-dist
+
+# stage runtime
+FROM ubuntu:24.04 AS runtime
+RUN apt update && apt install -y libxml2 libcurl4 \
+    libjpeg-turbo8 libpng16-16 libwebp7 libfreetype6 libtidy5deb1 \
+    libonig5 libzip4 zlib1g libssl3 libicu74 libsqlite3-0 libreadline8 libxslt1.1 libargon2-1 \
+    # --- MongoDB runtime ---
+    libsasl2-2 libsasl2-modules \
+    # --- Imagick runtime ---
+    imagemagick libmagickwand-6.q16-7 libmagickcore-6.q16-7 \
+    && apt clean
+RUN apt install -y ffmpeg poppler-utils libreoffice nginx=1.24.0-2ubuntu7.5 npm nodejs unzip rsync vim sudo net-tools curl psmisc
+RUN addgroup colombo && adduser --ingroup colombo colombo && mkdir -p /u01/colombo /s/
+RUN echo "colombo ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/colombo \
+    && chmod 440 /etc/sudoers.d/colombo
+COPY ./conf/etc/ /u01/colombo/etc/
+COPY ./conf/colombo/ /u01/colombo/www/
+COPY ./conf/s/ /s/
+RUN mkdir -p /u01/colombo/var/run /u01/colombo/var/cache/nginx/static /u01/colombo/var/log/nginx /u01/colombo/var/log/php-fpm /u01/colombo/libreoffice/program /u01/colombo/usr/bin/ /u01/colombo/www/colombo4 \
+    && mkdir -p /u01/colombo/var/cache/nginx/{client_temp,proxy_temp,fastcgi_temp,uwsgi_temp,scgi_temp} \
+    && ln -sf /dev/stdout /u01/colombo/var/log/nginx/access.log \
+    && ln -sf /dev/stderr /u01/colombo/var/log/nginx/error.log \
+    && ln -sf /dev/stderr /u01/colombo/var/log/nginx/errorgw.log \
+    && ln -sf /dev/stderr /u01/colombo/var/log/php-fpm/error.log \
+    && ln -sf /usr/bin/pdftotext /u01/colombo/usr/bin/pdftotext \
+    && ln -sf /usr/bin/soffice /u01/colombo/libreoffice/program/soffice \
+    && ln -sf /usr/bin/ffmpeg /u01/colombo/usr/bin/ffmpeg 
+    # && chown -R colombo:colombo /var/log/ /usr/local/ /var/run/ /var/lib/nginx/ /var/www/
+RUN chown -R colombo:colombo /u01 && chmod -R +x /s && chown -R colombo:colombo /s
+USER colombo
+WORKDIR /u01/colombo/www/colombo4
+RUN ln -s /u01/data_share/upload ./upload \
+    && ln -s /u01/colombo/www/3rdparty ./3rdparty \
+    && ln -s /u01/colombo/www/publish ./publish \
+    && ln -s /u01/colombo/www/colomboConfig.php ./colomboConfig.php \
+    && ln -s /u01/colombo/www/configIP.php ./configIP.php \
+    && ln -s /u01/colombo/www/configK8S.php ./configK8S.php \
+    && ln -s /u01/colombo/www/nodejs ./nodejs \
+    && ln -s /u01/colombo/www/node_modules ./node_modules
+
+COPY --from=builder /usr/local/php /u01/colombo/usr
+ENV PATH="/u01/colombo/usr/bin:/u01/colombo/usr/sbin:${PATH}"
+
+COPY --chown=colombo:colombo --from=vendor /app/vendor vendor
+COPY --chown=colombo:colombo . /u01/colombo/www/colombo4
+
+#CMD [ "php-fpm", "--nodaemonize", "--fpm-config", "/u01/colombo/etc/php-fpm.d/www.conf", "--php-ini", "/u01/colombo/etc/php.ini" ]
+#CMD [ "nginx", "-g", "daemon off;", "-c", "/u01/colombo/etc/nginx/nginx.conf" ]
+#CMD [ "nginx", "-g", "daemon off;", "-c", "/u01/colombo/etc/nginx/nginxgw.conf" ]
+
+EXPOSE 80
+EXPOSE 8080
