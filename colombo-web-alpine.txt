@@ -1,0 +1,153 @@
+# Stage 1: Composer dependencies
+FROM composer:2 AS vendor
+WORKDIR /app
+COPY composer.json composer.lock ./
+RUN --mount=type=cache,target=/root/.composer \
+    composer config allow-plugins.ayesh/composer-preload true && composer install --ignore-platform-reqs --optimize-autoloader --no-dev --prefer-dist
+
+FROM php:8.2-fpm-alpine
+RUN set -eux; apk add --no-cache nginx supervisor curl tzdata linux-headers net-tools procps \
+    # poppler pdftotext, ffmpeg, pngquant
+    poppler-utils poppler-data ffmpeg rsync openssh \
+    # pngquant
+    # libreoffice and fonts
+    libreoffice ttf-dejavu font-noto font-noto-emoji \
+    # runtime libs for extensions
+    icu-libs libxml2 libpng libjpeg-turbo freetype libzip libxslt tidyhtml-libs \
+    # support pecl extensions 
+    imagemagick \
+    && apk add --no-cache --virtual .build-deps $PHPIZE_DEPS icu-dev libxml2-dev libpng-dev libjpeg-turbo-dev freetype-dev libzip-dev zlib-dev tidyhtml-dev \
+    # support pecl extensions 
+    imagemagick-dev curl-dev \
+    # ===== PHP extensions =====
+    && docker-php-ext-configure gd --with-freetype --with-jpeg \
+    && docker-php-ext-install -j"$(nproc)" intl opcache soap sockets tidy gd zip simplexml \
+    # ====== External PHP extensions (PECL) ======
+    && pecl install redis-5.3.7 apcu-5.1.22 mongodb-1.17.0 imagick-3.7.0 solr-2.6.0 \
+    && docker-php-ext-enable redis apcu mongodb imagick solr \
+    # ====== Cleanup build dependencies ======
+    && apk del --no-network .build-deps \
+    && rm -rf /tmp/pear ~/.pearrc
+
+#RUN curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
+
+RUN addgroup -g 1000 -S colombo \
+    && adduser -u 1000 -S colombo -G colombo
+
+COPY ./conf/etc/ /u01/colombo/etc/
+COPY ./conf/colombo/ /u01/colombo/www/
+
+RUN mkdir -p /var/log/supervisor /u01/colombo/var/run /u01/colombo/var/cache/nginx/static /u01/colombo/var/log/nginx /u01/colombo/var/log/php-fpm /u01/colombo/libreoffice/program /u01/colombo/usr/bin/ /u01/colombo/www/colombo4 \
+    && ln -sf /dev/stdout /u01/colombo/var/log/nginx/access.log \
+    && ln -sf /dev/stderr /u01/colombo/var/log/nginx/error.log \
+    && ln -sf /dev/stderr /u01/colombo/var/log/nginx/errorgw.log \
+    && ln -sf /dev/stderr /u01/colombo/var/log/php-fpm/error.log \
+    && ln -sf /u01/colombo/etc/supervisord.conf /etc/supervisord.conf \
+    && ln -sf /usr/local/bin/php /u01/colombo/usr/bin/php \ 
+    && ln -sf /usr/bin/pdftotext /u01/colombo/usr/bin/pdftotext \
+    && ln -sf /usr/bin/soffice /u01/colombo/libreoffice/program/soffice \
+    && ln -sf /usr/bin/ffmpeg /u01/colombo/usr/bin/ffmpeg \
+    && chown -R colombo:colombo /var/log/ /usr/local/ /u01/ /var/run/ /var/lib/nginx/ /var/www/
+
+USER colombo
+
+WORKDIR /u01/colombo/www/colombo4
+RUN ln -s /u01/data_share/upload ./upload \
+    && ln -s /u01/colombo/www/3rdparty ./3rdparty \
+    && ln -s /u01/colombo/www/publish ./publish \
+    && ln -s /u01/colombo/www/colomboConfig.php ./colomboConfig.php \
+    && ln -s /u01/colombo/www/configIP.php ./configIP.php \
+    && ln -s /u01/colombo/www/configK8S.php ./configK8S.php \
+    && ln -s /u01/colombo/www/nodejs ./nodejs \
+    && ln -s /u01/colombo/www/node_modules ./node_modules
+
+#COPY composer.json composer.lock ./
+#RUN --mount=type=cache,target=/root/.composer,uid=1000,gid=1000 \
+#    composer config allow-plugins.ayesh/composer-preload true && composer install --ignore-platform-reqs --optimize-autoloader --no-dev --prefer-dist
+COPY --chown=colombo:colombo --from=vendor /app/vendor vendor
+
+COPY --chown=colombo:colombo . /u01/colombo/www/colombo4
+
+
+#RUN rm -rf conf/
+
+# Container healthcheck (gateway layer)
+#HEALTHCHECK --interval=30s --timeout=5s --retries=3 CMD curl -fsS http://127.0.0.1/healthz || exit 1
+
+EXPOSE 8000
+EXPOSE 8080
+
+# Run all processes under supervisor /usr/bin/supervisord -c /u01/colombo/etc/supervisord.conf -n
+ENTRYPOINT ["/usr/bin/supervisord", "-c", "/u01/colombo/etc/supervisord.conf", "-n"]
+
+#/u01/colombo/etc/supervisord.conf
+[unix_http_server]
+file=/var/run/supervisor.sock
+chmod=0700
+
+[rpcinterface:supervisor]
+supervisor.rpcinterface_factory = supervisor.rpcinterface:make_main_rpcinterface
+
+[supervisorctl]
+serverurl=unix:///var/run/supervisor.sock
+
+[supervisord]
+nodaemon=true
+logfile=/var/log/supervisor/supervisord.log
+pidfile=/var/run/supervisord.pid
+
+[program:php-fpm]
+command=/usr/local/sbin/php-fpm -c /u01/colombo/etc/php.ini --nodaemonize --fpm-config /u01/colombo/etc/php-fpm.d/www.conf
+autorestart=true
+priority=5
+#user=colombo
+stdout_logfile=/dev/stdout
+stdout_logfile_maxbytes=0
+stderr_logfile=/dev/stderr
+stderr_logfile_maxbytes=0
+
+[program:nginx]
+command=/usr/sbin/nginx -c /u01/colombo/etc/nginx/nginx.conf -g 'daemon off;'
+autorestart=true
+stopasgroup=true
+killasgroup=true
+stopsignal=TERM
+stopwaitsecs=10
+priority=10
+#user=root
+stdout_logfile=/dev/stdout
+stdout_logfile_maxbytes=0
+stderr_logfile=/dev/stderr
+stderr_logfile_maxbytes=0
+
+[program:nginxgw]
+command=/usr/sbin/nginx -c /u01/colombo/etc/nginx/nginxgw.conf -g 'daemon off;'
+autorestart=true
+priority=15
+#user=root
+stdout_logfile=/dev/stdout
+stdout_logfile_maxbytes=0
+stderr_logfile=/dev/stderr
+stderr_logfile_maxbytes=0
+
+[program:init-scripts]
+command=/bin/sh -c "
+  php -c /u01/colombo/etc/php.ini /u01/colombo/www/crontab/exec.php '\\Core\\lib\\MakeLib::makeLib' &&
+  #/s/all start &&
+  php -c /u01/colombo/etc/php.ini /u01/colombo/www/crontab/exec.php '\\Core\\lib\\MakeLibJS::makeAll' "
+#autostart=true
+autorestart=false
+priority=20
+#user=colombo
+
+#php -c /u01/colombo/etc/php.ini" /u01/colombo/www/crontab/exec.php "$COMMAND"
+
+#bitcoin-cli 
+python3 
+#pngquant 
+/u01/colombo/usr/bin/pdftotext 
+/u01/colombo/usr/bin/ffmpeg 
+#heif-convert 
+/u01/colombo/usr/bin/spritevideo 
+/u01/colombo/libreoffice/program/soffice
+#/u01/colombo/www/phantomjs/bin/phantomjs 
